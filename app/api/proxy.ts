@@ -24,7 +24,7 @@ export async function handle(
   const headers = new Headers(
     Array.from(req.headers.entries()).filter((item) => {
       if (
-        item[0].indexOf("x-") > -1 ||
+        (item[0].indexOf("x-") > -1 && item[0] !== "x-api-key") ||
         item[0].indexOf("sec-") > -1 ||
         skipHeaders.includes(item[0])
       ) {
