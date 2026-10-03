@@ -508,7 +508,7 @@ export class ChatGPTApi implements LLMApi {
 
     const resJson = (await res.json()) as OpenAIListModelResponse;
     const chatModels = resJson.data?.filter(
-      (m) => m.id.startsWith("gpt-") || m.id.startsWith("chatgpt-"),
+      (m) => !/embed|whisper|tts|dall-e|moderation|rerank/i.test(m.id),
     );
     console.log("[Models]", chatModels);
 
