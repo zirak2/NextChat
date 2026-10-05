@@ -614,7 +614,15 @@ export const useChatStore = createPersistStore(
           : shortTermMemoryStartIndex;
         // and if user has cleared history messages, we should exclude the memory too.
         const contextStartIndex = Math.max(clearContextIndex, memoryStartIndex);
-        const maxTokenThreshold = modelConfig.max_tokens;
+        // NOTE: max_tokens is the *output* limit, but NextChat also reuses it as
+        // the budget for how much chat history is sent. For Claude (200k+
+        // context) that silently truncates long conversations, so use a
+        // much bigger history budget there.
+        const maxTokenThreshold =
+          modelConfig.providerName === ServiceProvider.Anthropic ||
+          /claude/i.test(modelConfig.model)
+            ? Math.max(modelConfig.max_tokens, 150000)
+            : modelConfig.max_tokens;
 
         // get recent messages as much as possible
         const reversedRecentMessages = [];
@@ -860,7 +868,7 @@ export const useChatStore = createPersistStore(
   },
   {
     name: StoreKey.Chat,
-    version: 3.3,
+    version: 3.4,
     migrate(persistedState, version) {
       const state = persistedState as any;
       const newState = JSON.parse(
@@ -922,6 +930,24 @@ export const useChatStore = createPersistStore(
           const config = useAppConfig.getState();
           s.mask.modelConfig.compressModel = "";
           s.mask.modelConfig.compressProviderName = "";
+        });
+      }
+
+      // Every chat keeps its OWN copy of the model settings, and that copy
+      // overrides the global Settings page. Old Claude chats are therefore
+      // stuck on the old defaults (4000 output tokens, 4 history messages).
+      if (version < 3.4) {
+        newState.sessions.forEach((s) => {
+          const mc = s.mask.modelConfig;
+          if (
+            mc.providerName !== ("Anthropic" as any) &&
+            !/claude/i.test(mc.model)
+          )
+            return;
+          if (mc.max_tokens === 4000) mc.max_tokens = 16000;
+          if (mc.historyMessageCount === 4) mc.historyMessageCount = 64;
+          if (mc.anthropicThinking === undefined) mc.anthropicThinking = true;
+          if (mc.anthropicEffort === undefined) mc.anthropicEffort = "high";
         });
       }
 

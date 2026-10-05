@@ -81,6 +81,10 @@ export const DEFAULT_CONFIG = {
     size: "1024x1024" as ModelSize,
     quality: "standard" as DalleQuality,
     style: "vivid" as DalleStyle,
+
+    // Anthropic only: let the model think before answering (like claude.ai)
+    anthropicThinking: true,
+    anthropicEffort: "high" as AnthropicEffort,
   },
 
   ttsConfig: {
@@ -105,6 +109,8 @@ export const DEFAULT_CONFIG = {
     voice: "alloy" as Voice,
   },
 };
+
+export type AnthropicEffort = "low" | "medium" | "high" | "xhigh" | "max";
 
 export type ChatConfig = typeof DEFAULT_CONFIG;
 
@@ -195,7 +201,7 @@ export const useAppConfig = createPersistStore(
   }),
   {
     name: StoreKey.Config,
-    version: 4.1,
+    version: 4.2,
 
     merge(persistedState, currentState) {
       const state = persistedState as ChatConfig | undefined;
@@ -253,6 +259,24 @@ export const useAppConfig = createPersistStore(
           DEFAULT_CONFIG.modelConfig.compressModel;
         state.modelConfig.compressProviderName =
           DEFAULT_CONFIG.modelConfig.compressProviderName;
+      }
+
+      if (version < 4.2) {
+        // Claude can output far more than the old 4000 default, and only
+        // seeing the last 4 messages hurts quality a lot compared to claude.ai
+        if (
+          state.modelConfig.providerName === ("Anthropic" as any) ||
+          /claude/i.test(state.modelConfig.model)
+        ) {
+          if (state.modelConfig.max_tokens === 4000) {
+            state.modelConfig.max_tokens = 16000;
+          }
+          if (state.modelConfig.historyMessageCount === 4) {
+            state.modelConfig.historyMessageCount = 64;
+          }
+        }
+        state.modelConfig.anthropicThinking = true;
+        state.modelConfig.anthropicEffort = "high";
       }
 
       return state as any;
