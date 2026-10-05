@@ -157,7 +157,12 @@ export class ClaudeApi implements LLMApi {
       let i = 0;
       while (i < lines.length && (lines[i].startsWith(">") || !lines[i].trim()))
         i++;
-      return i > 0 && i < lines.length ? lines.slice(i).join("\n") : text;
+      let end = lines.length;
+      while (end > i && (lines[end - 1].startsWith(">") || !lines[end - 1].trim()))
+        end--;
+      return (i > 0 || end < lines.length) && i < end
+        ? lines.slice(i, end).join("\n")
+        : text;
     };
     const textOf = (v: (typeof messages)[number]) => {
       const text = getMessageTextContent(v);
@@ -280,6 +285,7 @@ export class ClaudeApi implements LLMApi {
       // back to the API in front of tool_use blocks when a tool is called.
       let thinkingBlocks: any[] = [];
       let curBlock: any = null;
+      let thinkingSeen = 0; // thinking blocks received in the current response
       const [tools, funcs] = usePluginStore
         .getState()
         .getAsTools(
@@ -313,28 +319,50 @@ export class ClaudeApi implements LLMApi {
             };
           }
 
-          // Handle refusal stop reason in message_delta
-          if (chunkJson?.delta?.stop_reason === "refusal") {
-            const refusalMessage =
-              "\n\n[Assistant refused to respond. Please modify your request and try again.]";
-            options.onError?.(
-              new Error("Content policy violation: " + refusalMessage),
-            );
-            return { isThinking: false, content: refusalMessage };
+          if (chunkJson?.type === "message_start") {
+            thinkingSeen = 0;
+            return none;
           }
-          // Tell the user when the answer was cut off by the output limit
-          if (chunkJson?.delta?.stop_reason === "max_tokens") {
-            return {
-              isThinking: false,
-              content: `\n\n[Cut off: hit the max output tokens limit (${maxTokens}, thinking included). Raise "Max Tokens" in THIS chat's settings.]`,
-            };
+
+          // End of one model response: add a small status line so it is
+          // obvious whether thinking was requested and whether it happened.
+          if (chunkJson?.type === "message_delta") {
+            const reason = chunkJson?.delta?.stop_reason;
+            const u = chunkJson?.usage ?? {};
+            let status = "";
+            if (reason !== "tool_use") {
+              if (requestBody.thinking) {
+                const eff = requestBody.output_config?.effort;
+                status =
+                  `\n\n> ⚙ thinking requested (${requestBody.thinking.type}` +
+                  `${eff ? ", effort " + eff : ""}) · thinking blocks received: ${thinkingSeen}` +
+                  ` · thinking tokens: ${
+                    u.output_tokens_details?.thinking_tokens ?? "n/a"
+                  } · output tokens: ${u.output_tokens ?? "n/a"}`;
+              } else if (wantThinking) {
+                status = `\n\n> ⚙ thinking was NOT sent: model name "${model}" is not recognised as a thinking model`;
+              }
+            }
+            let notice = "";
+            if (reason === "refusal") {
+              notice =
+                "\n\n[Assistant refused to respond. Please modify your request and try again.]";
+              options.onError?.(
+                new Error("Content policy violation: " + notice),
+              );
+            } else if (reason === "max_tokens") {
+              notice = `\n\n[Cut off: hit the max output tokens limit (${maxTokens}, thinking included). Raise "Max Tokens" in THIS chat's settings.]`;
+            }
+            return { isThinking: false, content: notice + status };
           }
 
           const block = chunkJson?.content_block;
           if (chunkJson?.type === "content_block_start") {
             if (block?.type === "thinking") {
+              thinkingSeen += 1;
               curBlock = { type: "thinking", thinking: "", signature: "" };
             } else if (block?.type === "redacted_thinking") {
+              thinkingSeen += 1;
               thinkingBlocks.push(block);
             } else if (block?.type === "tool_use") {
               index += 1;
