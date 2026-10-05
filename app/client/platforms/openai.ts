@@ -67,6 +67,7 @@ export interface RequestPayload {
   top_p: number;
   max_tokens?: number;
   max_completion_tokens?: number;
+  reasoning_effort?: string;
 }
 
 export interface DalleRequestPayload {
@@ -263,6 +264,22 @@ export class ChatGPTApi implements LLMApi {
       if (visionModel && !isO1OrO3 && ! isGpt5) {
         requestPayload["max_tokens"] = Math.max(modelConfig.max_tokens, 4000);
       }
+
+      // Claude behind an OpenAI-compatible endpoint: if max_tokens is not sent,
+      // most gateways silently fall back to a ~4096 default, so the "Max Tokens"
+      // setting in the UI would have no effect at all.
+      if (/claude/i.test(modelConfig.model)) {
+        requestPayload["max_tokens"] = modelConfig.max_tokens;
+        // Gateways (LiteLLM, OpenRouter, new-api ...) map reasoning_effort to
+        // Claude thinking. Untick "Claude thinking" if your gateway rejects it.
+        if (modelConfig.anthropicThinking ?? true) {
+          const effort = modelConfig.anthropicEffort ?? "high";
+          requestPayload["reasoning_effort"] =
+            effort === "xhigh" || effort === "max" ? "high" : effort;
+          // thinking is incompatible with non-default sampling on Claude
+          requestPayload["temperature"] = 1;
+        }
+      }
     }
 
     console.log("[Request] openai payload: ", requestPayload);
@@ -331,6 +348,13 @@ export class ChatGPTApi implements LLMApi {
             }>;
 
             if (!choices?.length) return { isThinking: false, content: "" };
+
+            if ((choices[0] as any)?.finish_reason === "length") {
+              return {
+                isThinking: false,
+                content: `\n\n[Cut off: the model hit its max output tokens limit. Raise "Max Tokens" in THIS chat's settings.]`,
+              };
+            }
 
             const tool_calls = choices[0]?.delta?.tool_calls;
             if (tool_calls?.length > 0) {

@@ -10,7 +10,7 @@ import {
 import { getClientConfig } from "@/app/config/client";
 import { ANTHROPIC_BASE_URL } from "@/app/constant";
 import { getMessageTextContent, isVisionModel } from "@/app/utils";
-import { preProcessImageContent, stream } from "@/app/utils/chat";
+import { preProcessImageContent, streamWithThink } from "@/app/utils/chat";
 import { cloudflareAIGatewayUrl } from "@/app/utils/cloudflare";
 import { RequestPayload } from "./openai";
 import { fetch } from "@/app/utils/stream";
@@ -40,6 +40,11 @@ export interface AnthropicChatRequest {
   top_k?: number; // Only sample from the top K options for each subsequent token.
   metadata?: object; // An object describing metadata about the request.
   stream?: boolean; // Whether to incrementally stream the response using server-sent events.
+  system?: string; // System prompt (must be top-level, not a "user" message).
+  thinking?:
+    | { type: "adaptive"; display?: "summarized" | "omitted" }
+    | { type: "enabled"; budget_tokens: number; display?: "summarized" };
+  output_config?: { effort: string };
 }
 
 export interface ChatRequest {
@@ -71,6 +76,33 @@ const ClaudeMapper = {
   system: "user",
 } as const;
 
+
+/**
+ * Claude 4.7+ / 5.x models (Sonnet 5.x, Opus 5.x, Fable, Mythos ...):
+ *  - only support adaptive thinking (`type: "enabled"` + budget_tokens => 400)
+ *  - reject non-default temperature / top_p / top_k (=> 400)
+ */
+export function isAdaptiveOnlyClaude(model: string) {
+  return /claude-(?:opus|sonnet|haiku|fable|mythos)-(?:4-(?:[7-9]|1\d)(?!\d)|(?:[5-9]|\d{2,})(?!\d{4}))/i.test(
+    model,
+  );
+}
+
+/** Legacy models that can think with a manual token budget. */
+export function isLegacyThinkingClaude(model: string) {
+  return /claude-(?:3-7-sonnet|(?:sonnet|opus)-4(?:-[0-6])?(?:-\d{8})?$|(?:sonnet|opus|haiku)-4-[56])/i.test(
+    model,
+  );
+}
+
+const LEGACY_THINKING_BUDGET: Record<string, number> = {
+  low: 2048,
+  medium: 4096,
+  high: 10000,
+  xhigh: 16000,
+  max: 24000,
+};
+
 const keys = ["claude-2, claude-instant-1"];
 
 export class ClaudeApi implements LLMApi {
@@ -81,7 +113,11 @@ export class ClaudeApi implements LLMApi {
   extractMessage(res: any) {
     console.log("[Response] claude response: ", res);
 
-    return res?.content?.[0]?.text;
+    if (res?.error) return `[Anthropic API error: ${res.error.message}]`;
+    return (res?.content ?? [])
+      .filter((b: any) => b?.type === "text")
+      .map((b: any) => b.text)
+      .join("");
   }
   async chat(options: ChatOptions): Promise<void> {
     const visionModel = isVisionModel(options.config.model);
@@ -99,32 +135,36 @@ export class ClaudeApi implements LLMApi {
     };
 
     // try get base64image from local cache image_url
+    // System prompts (mask context, memory summary, MCP prompt ...) are sent in
+    // Anthropic's top-level `system` field instead of being faked as user turns.
+    const systemTexts: string[] = [];
     const messages: ChatOptions["messages"] = [];
     for (const v of options.messages) {
+      if (v.role === "system") {
+        const t = getMessageTextContent(v).trim();
+        if (t) systemTexts.push(t);
+        continue;
+      }
       const content = await preProcessImageContent(v.content);
       messages.push({ role: v.role, content });
     }
+    const systemPrompt = systemTexts.join("\n\n");
 
-    const keys = ["system", "user"];
-
-    // roles must alternate between "user" and "assistant" in claude, so add a fake assistant message between two user messages
-    for (let i = 0; i < messages.length - 1; i++) {
-      const message = messages[i];
-      const nextMessage = messages[i + 1];
-
-      if (keys.includes(message.role) && keys.includes(nextMessage.role)) {
-        messages[i] = [
-          message,
-          {
-            role: "assistant",
-            content: ";",
-          },
-        ] as any;
-      }
-    }
+    // thinking is shown as a "> quoted" block at the top of assistant messages,
+    // never send it back to the model as if it were part of the answer
+    const stripThinking = (text: string) => {
+      const lines = text.split("\n");
+      let i = 0;
+      while (i < lines.length && (lines[i].startsWith(">") || !lines[i].trim()))
+        i++;
+      return i > 0 && i < lines.length ? lines.slice(i).join("\n") : text;
+    };
+    const textOf = (v: (typeof messages)[number]) => {
+      const text = getMessageTextContent(v);
+      return v.role === "assistant" ? stripThinking(text) : text;
+    };
 
     const prompt = messages
-      .flat()
       .filter((v) => {
         if (!v.content) return false;
         if (typeof v.content === "string" && !v.content.trim()) return false;
@@ -137,7 +177,7 @@ export class ClaudeApi implements LLMApi {
         if (!visionModel || typeof content === "string") {
           return {
             role: insideRole,
-            content: getMessageTextContent(v),
+            content: textOf(v),
           };
         }
         return {
@@ -172,6 +212,20 @@ export class ClaudeApi implements LLMApi {
         };
       });
 
+    // roles must alternate between "user" and "assistant" in claude
+    const merged: typeof prompt = [];
+    for (const m of prompt) {
+      const last = merged[merged.length - 1];
+      if (last && last.role === m.role) {
+        merged.push({
+          role: m.role === "user" ? "assistant" : "user",
+          content: ";",
+        });
+      }
+      merged.push(m);
+    }
+    prompt.splice(0, prompt.length, ...merged);
+
     if (prompt[0]?.role === "assistant") {
       prompt.unshift({
         role: "user",
@@ -179,17 +233,41 @@ export class ClaudeApi implements LLMApi {
       });
     }
 
+    // ---- sampling + thinking -------------------------------------------
+    const model = modelConfig.model;
+    const adaptiveOnly = isAdaptiveOnlyClaude(model);
+    const legacyThinking = !adaptiveOnly && isLegacyThinkingClaude(model);
+    const wantThinking = modelConfig.anthropicThinking ?? true;
+    const effort = modelConfig.anthropicEffort ?? "high";
+    const maxTokens = modelConfig.max_tokens;
+
     const requestBody: AnthropicChatRequest = {
       messages: prompt,
       stream: shouldStream,
-
-      model: modelConfig.model,
-      max_tokens: modelConfig.max_tokens,
-      temperature: modelConfig.temperature,
-      top_p: modelConfig.top_p,
-      // top_k: modelConfig.top_k,
-      top_k: 5,
+      model,
+      max_tokens: maxTokens,
     };
+    if (systemPrompt) requestBody.system = systemPrompt;
+
+    if (adaptiveOnly) {
+      // Sonnet 5.x etc: temperature/top_p/top_k must NOT be sent at all.
+      if (wantThinking) {
+        requestBody.thinking = { type: "adaptive", display: "summarized" };
+        requestBody.output_config = { effort };
+      }
+    } else if (legacyThinking && wantThinking && maxTokens > 2048) {
+      // thinking requires temperature 1 and budget_tokens < max_tokens
+      requestBody.thinking = {
+        type: "enabled",
+        budget_tokens: Math.min(
+          LEGACY_THINKING_BUDGET[effort] ?? 10000,
+          maxTokens - 1024,
+        ),
+      };
+    } else {
+      // newer legacy models reject temperature + top_p together, so only temperature
+      requestBody.temperature = modelConfig.temperature;
+    }
 
     const path = this.path(Anthropic.ChatPath);
 
@@ -198,12 +276,16 @@ export class ClaudeApi implements LLMApi {
 
     if (shouldStream) {
       let index = -1;
+      // thinking blocks (with signatures) of the current turn. They must be sent
+      // back to the API in front of tool_use blocks when a tool is called.
+      let thinkingBlocks: any[] = [];
+      let curBlock: any = null;
       const [tools, funcs] = usePluginStore
         .getState()
         .getAsTools(
           useChatStore.getState().currentSession().mask?.plugin || [],
         );
-      return stream(
+      return streamWithThink(
         path,
         requestBody,
         {
@@ -220,56 +302,79 @@ export class ClaudeApi implements LLMApi {
         controller,
         // parseSSE
         (text: string, runTools: ChatMessageTool[]) => {
-          // console.log("parseSSE", text, runTools);
-          let chunkJson:
-            | undefined
-            | {
-                type: "content_block_delta" | "content_block_stop" | "message_delta" | "message_stop";
-                content_block?: {
-                  type: "tool_use";
-                  id: string;
-                  name: string;
-                };
-                delta?: {
-                  type: "text_delta" | "input_json_delta";
-                  text?: string;
-                  partial_json?: string;
-                  stop_reason?: string;
-                };
-                index: number;
-              };
-          chunkJson = JSON.parse(text);
+          const chunkJson: any = JSON.parse(text);
+          const none = { isThinking: false, content: "" };
+
+          if (chunkJson?.type === "error") {
+            const msg = chunkJson?.error?.message ?? text;
+            return {
+              isThinking: false,
+              content: `\n\n[Anthropic API error: ${msg}]`,
+            };
+          }
 
           // Handle refusal stop reason in message_delta
           if (chunkJson?.delta?.stop_reason === "refusal") {
-            // Return a message to display to the user
-            const refusalMessage = "\n\n[Assistant refused to respond. Please modify your request and try again.]";
-            options.onError?.(new Error("Content policy violation: " + refusalMessage));
-            return refusalMessage;
+            const refusalMessage =
+              "\n\n[Assistant refused to respond. Please modify your request and try again.]";
+            options.onError?.(
+              new Error("Content policy violation: " + refusalMessage),
+            );
+            return { isThinking: false, content: refusalMessage };
+          }
+          // Tell the user when the answer was cut off by the output limit
+          if (chunkJson?.delta?.stop_reason === "max_tokens") {
+            return {
+              isThinking: false,
+              content: `\n\n[Cut off: hit the max output tokens limit (${maxTokens}, thinking included). Raise "Max Tokens" in THIS chat's settings.]`,
+            };
           }
 
-          if (chunkJson?.content_block?.type == "tool_use") {
-            index += 1;
-            const id = chunkJson?.content_block.id;
-            const name = chunkJson?.content_block.name;
-            runTools.push({
-              id,
-              type: "function",
-              function: {
-                name,
-                arguments: "",
-              },
-            });
+          const block = chunkJson?.content_block;
+          if (chunkJson?.type === "content_block_start") {
+            if (block?.type === "thinking") {
+              curBlock = { type: "thinking", thinking: "", signature: "" };
+            } else if (block?.type === "redacted_thinking") {
+              thinkingBlocks.push(block);
+            } else if (block?.type === "tool_use") {
+              index += 1;
+              runTools.push({
+                id: block.id,
+                type: "function",
+                function: {
+                  name: block.name,
+                  arguments: "",
+                },
+              });
+            }
+            return none;
           }
-          if (
-            chunkJson?.delta?.type == "input_json_delta" &&
-            chunkJson?.delta?.partial_json
-          ) {
+          if (chunkJson?.type === "content_block_stop") {
+            if (curBlock) {
+              thinkingBlocks.push(curBlock);
+              curBlock = null;
+            }
+            return none;
+          }
+
+          const delta = chunkJson?.delta;
+          if (delta?.type === "thinking_delta") {
+            if (curBlock) curBlock.thinking += delta.thinking ?? "";
+            return { isThinking: true, content: delta.thinking ?? "" };
+          }
+          if (delta?.type === "signature_delta") {
+            if (curBlock) curBlock.signature += delta.signature ?? "";
+            return none;
+          }
+          if (delta?.type == "input_json_delta" && delta?.partial_json) {
             // @ts-ignore
-            runTools[index]["function"]["arguments"] +=
-              chunkJson?.delta?.partial_json;
+            runTools[index]["function"]["arguments"] += delta.partial_json;
+            return none;
           }
-          return chunkJson?.delta?.text;
+          if (delta?.type === "text_delta") {
+            return { isThinking: false, content: delta.text ?? "" };
+          }
+          return none;
         },
         // processToolMessage, include tool_calls message and tool call results
         (
@@ -279,6 +384,8 @@ export class ClaudeApi implements LLMApi {
         ) => {
           // reset index value
           index = -1;
+          const priorThinking = thinkingBlocks;
+          thinkingBlocks = [];
           // @ts-ignore
           requestPayload?.messages?.splice(
             // @ts-ignore
@@ -286,16 +393,17 @@ export class ClaudeApi implements LLMApi {
             0,
             {
               role: "assistant",
-              content: toolCallMessage.tool_calls.map(
-                (tool: ChatMessageTool) => ({
+              content: [
+                ...priorThinking,
+                ...toolCallMessage.tool_calls.map((tool: ChatMessageTool) => ({
                   type: "tool_use",
                   id: tool.id,
                   name: tool?.function?.name,
                   input: tool?.function?.arguments
                     ? JSON.parse(tool?.function?.arguments)
                     : {},
-                }),
-              ),
+                })),
+              ],
             },
             // @ts-ignore
             ...toolCallResult.map((result) => ({
