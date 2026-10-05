@@ -1,5 +1,6 @@
 import { ServiceProvider } from "@/app/constant";
 import { ModalConfigValidator, ModelConfig } from "../store";
+import type { AnthropicEffort } from "../store/config";
 
 import Locale from "../locales";
 import { InputRange } from "./input-range";
@@ -109,6 +110,50 @@ export function ModelConfigList(props: {
           }
         ></input>
       </ListItem>
+
+      {props.modelConfig?.providerName == ServiceProvider.Anthropic ||
+      /claude/i.test(props.modelConfig?.model ?? "") ? (
+        <>
+          <ListItem
+            title="Claude thinking"
+            subTitle="Let Claude reason before answering (like claude.ai). Thinking tokens count toward Max Tokens, so use 16000 or more."
+          >
+            <input
+              aria-label="Claude thinking"
+              type="checkbox"
+              checked={props.modelConfig.anthropicThinking ?? true}
+              onChange={(e) =>
+                props.updateConfig(
+                  (config) =>
+                    (config.anthropicThinking = e.currentTarget.checked),
+                )
+              }
+            ></input>
+          </ListItem>
+          <ListItem
+            title="Thinking effort"
+            subTitle="Higher = deeper reasoning, slower, more tokens"
+          >
+            <Select
+              aria-label="Thinking effort"
+              value={props.modelConfig.anthropicEffort ?? "high"}
+              onChange={(e) =>
+                props.updateConfig(
+                  (config) =>
+                    (config.anthropicEffort = e.currentTarget
+                      .value as AnthropicEffort),
+                )
+              }
+            >
+              {["low", "medium", "high", "xhigh", "max"].map((v) => (
+                <option value={v} key={v}>
+                  {v}
+                </option>
+              ))}
+            </Select>
+          </ListItem>
+        </>
+      ) : null}
 
       {props.modelConfig?.providerName == ServiceProvider.Google ? null : (
         <>
